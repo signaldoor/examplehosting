@@ -7,24 +7,30 @@ import asyncio
 import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict, deque
 
+# Env
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 OLLAMA_URL = os.getenv("OLLAMA_URL")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN not set")
 if not OLLAMA_URL:
     raise RuntimeError("OLLAMA_URL not set")
 
+# user mem
+user_memory = defaultdict(lambda: deque(maxlen=10))
+
+# logging
 handler = logging.FileHandler(
     filename="discord.log",
     mode="w",
     encoding="utf8"
 )
 
+# setup
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -39,6 +45,7 @@ You speak with dry humor, restrained sarcasm, and quiet emotional depth.
 Stay in character at all times.
 """
 
+# server
 def start_http_server():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -48,25 +55,22 @@ def start_http_server():
             self.wfile.write(b"Bot is running")
 
         def log_message(self, format, *args):
-            return  # silence logs
+            return
 
     port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# AI CODE
-def ollama_chat(prompt: str, system_prompt: str) -> str:
+# ollama client
+def ollama_chat(prompt: str, system_prompt: str, memory: list) -> str:
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(memory)
+    messages.append({"role": "user", "content": prompt})
+
     response = requests.post(
         f"{OLLAMA_URL}/api/chat",
-        headers={
-            "Authorization": f"Bearer {OLLAMA_API_KEY}",
-        },
         json={
             "model": "qwen2.5:1.5b",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
             "stream": False,
         },
         timeout=120,
@@ -74,6 +78,7 @@ def ollama_chat(prompt: str, system_prompt: str) -> str:
     response.raise_for_status()
     return response.json()["message"]["content"]
 
+# events
 @bot.event
 async def on_ready():
     print(f"{bot.user} is online!")
@@ -82,12 +87,12 @@ async def on_ready():
 async def on_member_join(member):
     await member.send(f"Welcome to the server {member.name}")
 
-# AI CODE
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
+    # moderation
     if "retard" in message.content.lower():
         await message.delete()
         await message.channel.send(
@@ -95,20 +100,32 @@ async def on_message(message):
         )
         return
 
+    # AI command
     if message.content.startswith("!ai "):
+        user_id = message.author.id
         prompt = message.content[4:]
+
         await message.channel.typing()
 
         try:
             reply = await asyncio.to_thread(
                 ollama_chat,
                 prompt,
-                system_prompt
+                system_prompt,
+                list(user_memory[user_id])
             )
         except Exception as e:
             print(e)
             await message.channel.send("AI error.")
             return
+
+        # save memory
+        user_memory[user_id].append(
+            {"role": "user", "content": prompt}
+        )
+        user_memory[user_id].append(
+            {"role": "assistant", "content": reply}
+        )
 
         for chunk in (
             reply[i:i + 2000]
@@ -117,6 +134,12 @@ async def on_message(message):
             await message.channel.send(chunk)
 
     await bot.process_commands(message)
+
+# commands
+@bot.command()
+async def clear_memory(ctx):
+    user_memory.pop(ctx.author.id, None)
+    await ctx.send("Your AI memory has been cleared.")
 
 @bot.command()
 async def hello(ctx):
@@ -172,6 +195,7 @@ async def secret_error(ctx, error):
     if isinstance(error, commands.MissingRole):
         await ctx.send("You do not have permission to do that!")
 
+# start server
 threading.Thread(
     target=start_http_server,
     daemon=True
